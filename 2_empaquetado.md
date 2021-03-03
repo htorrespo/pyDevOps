@@ -288,3 +288,294 @@ Pipenv and Poetry are two new ways to produce Python projects. They are inspired
 
 However, their main strength is in allowing easier interactive development. This is useful, sometimes, for more exploratory programming.
 
+### 2.5.1 Poetry
+
+The easiest way to install poetry is to use pip install --user poetry. However, this will install all of its dependencies into your user environment, which has the potential to make a mess of things. One way to do it in a clean way is to create a dedicated virtual environment.
+
+```
+$ python3 -m venv ~/.venvs/poetry
+$ ~/.venvs/poetry/bin/pip install poetry
+$ alias poetry=~/.venvs/poetry/bin/poetry
+```
+
+This is an example of using an unactivated virtual environment.
+
+The best way to use poetry is to create a dedicated virtual environment for the project. We will build a small demo project. We will call it “useful.”
+
+```
+$ mkdir useful
+$ cd useful
+$ python3 -m venv build/useful
+$ source build/useful/bin/activate
+(useful)$ poetry init
+(useful)$ poetry add termcolor
+(useful)$ mkdir useful
+(useful)$ touch useful/__init__.py
+(useful)$ cat > useful/__main__.py
+import termcolor
+print(termcolor.colored("Hello", "red"))
+```
+
+If we have done all this, running python -m useful in the virtual environment will print a red Hello. After we have interactively tried various colors, and maybe decided to make the text bold, we are ready to release:
+
+```
+(useful)$ poetry build
+(useful)$ ls dist/
+useful-0.1.0-py2.py3-none-any.whl useful-0.1.0.tar.gz
+```
+
+### 2.5.2 Pipenv
+
+Pipenv is a tool to create virtual environments that match a specification, in addition to ways to evolve the specification. It relies on two files: Pipfile and Pipfile.lock. We can install pipenv similarly to how we installed poetry – in a custom virtual environment and add an alias.
+
+In order to start using it, we want to make sure no virtual environments are activated. Then,
+
+```
+$ mkdir useful
+$ cd useful
+$ pipenv add termcolor
+$ mkdir useful
+$ touch useful/__init__.py
+$ cat > useful/__main__.py
+import termcolor
+print(termcolor.colored("Hello", "red"))
+$ pipenv shell
+(useful-hwA3o_b5)$ python -m useful
+```
+
+This will leave in its wake a Pipfile that looks like this:
+
+```
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+[packages]
+termcolor = "∗"
+[dev-packages]
+[requires]
+python_version = "3.6"
+```
+
+Note that in order to package useful , we still have to write a setup.py. Pipenv limits itself to managing virtual environments, and it does consider building and publishing separate tasks.
+
+## 2.6 DevPI
+
+DevPI is a PyPI-compatible server that can be run locally. Though it does not scale to PyPI-like levels, it can be a powerful tool in a number of situations.
+
+DevPI is made up of three parts. The most important one is devpi-server. For many use cases, this is the only part that needs to run. The server serves, first and foremost, as a caching proxy to PyPI. It takes advantage of the fact that packages on PyPI are immutable: once we have a package, it can never change.
+
+There is also a web server that allows us to search in the local package directory. Since a lot of use cases do not even involve searching on the PyPI website, this is definitely optional. Finally, there is a client command-line tool that allows configuring various parameters on the running instance. The client is most useful in more esoteric use cases.
+
+Installing and running DevPI is straightforward. In a virtual environment, simply run:
+
+```
+(devpi)$ pip install devpi-server
+(devpi)$ devpi-server --start --init
+```
+
+The pip tool, by default, goes to pypi.org. For some basic testing of DevPI, we can create a new virtual environment, playground, and run:
+
+```
+(playground)$ pip install \
+              -i http://localhost:3141/root/pypi/+simple/ \
+              httpie glom
+(playground)$ http --body https://httpbin.org/get | glom '{"url":"url"}'
+{
+  "url": "https://httpbin.org/get"
+}
+```
+
+Having to specify the -i ... argument to pip every time would be annoying. After checking that everything worked correctly, we can put the configuration in an environment variable:
+
+```
+$ export PIP_INDEX_URL=http://localhost:3141/root/pypi/+simple/
+```
+
+Or to make things more permanent:
+
+```
+$ mkdir -p ~/.pip && cat > ~/.pip/pip.conf << EOF
+[global]
+index-url = http://localhost:3141/root/pypi/+simple/
+[search]
+index = http://localhost:3141/root/pypi/
+```
+
+The above file location works for UNIX operating systems. On Mac OS X the configuration file is $HOME/Library/Application Support/pip/pip.conf. On Windows the configuration file is %APPDATA%\pip\pip.ini.
+
+DevPI is useful for disconnected operations. If we need to install packages without a network, DevPI can be used to cache them. As mentioned earlier, virtual environments are disposable and often treated as mostly immutable. This means that a virtual environment with the right packages is not a useful thing without a network. The chances are high that some situation or the other will either require or suggest creating it from scratch.
+
+However, a caching server is a different matter. If all package retrieval is done through a caching proxy, then destroying a virtual environment and rebuilding it is fine, since the source of truth is the package cache. This is as useful for taking a laptop into the woods for disconnected development as it is for maintaining proper firewall boundaries and having a consistent record of all installed software.
+
+In order to “warm up” the DevPI cache , that is, make sure it contains all needed packages, we need to use pip to install them. One way to do it is, after configuring DevPI and pip, is to run tox against a source repository of software under development. Since tox goes through all test environments, it downloads all needed packages.
+
+It is definitely a good practice to also preinstall in a disposable virtual environment any requirements.txt that are relevant.
+
+However, the utility of DevPI is not limited to disconnected operations. Configuring one inside your build cluster, and pointing the build cluster at it, completely avoids the risk for a “leftpad incident,” where a package you rely on gets removed by the author from PyPI. It might also make builds faster, and it will definitely cut out a lot of outgoing traffic.
+
+Another use for DevPI is to test uploads, before uploading them to PyPI. Assuming devpi-server is already running on the default port, we can:
+
+```
+(devpi)$ pip install devpi-client twine
+(devpi)$ devpi use http://localhost:3141
+(devpi)$ devpi user -c testuser password=123
+(devpi)$ devpi login testuser --password=123
+(devpi)$ devpi index -c dev bases=root/pypi
+(devpi)$ devpi use testuser/dev
+(devpi)$ twine upload --repository http://localhost:3141/testuser/dev \
+               -u testuser -p 123 my-package-18.6.0.tar.gz
+(devpi)$ pip install -i http://localhost:3141/testuser/dev my-package
+```
+
+Note that this allows us to upload to an index that we only use explicitly, so we are not shadowing my-package for all environments that are not using this explicitly.
+
+An even more advanced use-case, we can do this:
+
+```
+(devpi)$ devpi index root/pypi mirror_url=https://ourdevpi.local
+```
+
+This will make our DevPI server a mirror of a local, “upstream,” DevPI server. This allows us to upload private packages to the “central” DevPI server, in order to share with our team. In those cases, the upstream DevPI server will often need to be run behind a proxy – and we need to have some tools to properly manage user access.
+
+Running a “centralized” DevPI behind a simple proxy that asks for username and password allows an effective private repository. For that, we would first want to remove the root/pypi index:
+
+```
+$ devpi index --delete root/pypi
+```
+
+and then re-create it with
+
+```
+$ devpi index --create root/pypi
+```
+
+This means the root index no longer will mirror pypi . We can upload packages now directly to it. This type of server is often used with the argument --extra-index-url to pip, to allow pip to retrieve both from the private repository and the external one. However, sometimes it is useful to have a DevPI instance that only serves specific packages. This allows enforcing rules about auditing before using any packages. Whenever a new package is needed, it is downloaded, audited, and then added to the private repository.
+
+## 2.7 Pex and Shiv
+
+While it is currently nontrivial to compile a Python program into one self-contained executable, we can do something that is almost as good. We can compile a Python program into a single file that only needs an installed interpreter to run. This takes advantage of the particular way Python handles startup.
+When running python /path/to/filename, Python does two things:
+
+- Adds the directory /path/to to the module path.
+
+- Executes the code in /path/to/filename.
+
+When running python/path/to/directory/, Python will behave exactly as though we typed python/path/to/directory/__main__.py.
+
+In other words, Python will do the following two things:
+
+- Add the directory /path/to/directory/ to the module path.
+
+- Executes the code in /path/to/directory/__main__.py.
+
+When running python /path/to/filename.zip, Python will treat the file as a directory.
+In other words, Python will do the following two things:
+
+- Add the “directory” /path/to/filename.zip to the module path.
+
+- Executes the code in the __main__.py it extracts from /path/to/filename.zip.
+
+Zip is an end-oriented format: The metadata, and pointers to the data, are all at the end. This means that adding a prefix to a zip file does not change its contents.
+
+So, if we take a zip file, and prefix it with #!/usr/bin/python<newline>, and mark it executable, then when running it, Python will be running a zip file. If we put the right bootstrapping code in __main__.py, and put the right modules in the zip file, we can get all of our third-party dependencies in one big file.
+
+Pex and Shiv are tools for producing such files, but they both rely on the same underlying behavior of Python and of zip files.
+
+### 2.7.1 Pex
+
+Pex can be used either as a command-line tool or as a library. When using it as a command-line tool, it is a good idea to prevent it from trying to do dependency resolution against PyPI. All dependency resolution algorithms are flawed in some way. However, due to pip’s popularity, packages will explicitly work around flaws in its algorithm. Pex is less popular, and there is no guarantee that packages will try explicitly to work with it.
+
+The safest thing to do is to use pip wheel to build all wheels in a directory and then tell Pex to use only this directory.
+
+For example,
+
+```
+$ pip wheel --wheel-dir my-wheels -r requirements.txt
+$ pex -o my-file.pex --find-links my-wheels --no-index \
+      -m some_package
+```
+
+Pex has a few ways to find the entry point. The two most popular ones are -m some_package, which will behave as though python -m some_package; or -c console-script, which will find what script would have been installed as console-script, and invoke the relevant entry point.
+
+It is also possible to use Pex as a library.
+
+```
+from pex import pex_builder
+```
+
+Most of the logic to build Pex files is in the pex_builder module.
+
+```
+builder = pex_builder.PEXBuilder()
+```
+
+We create a builder object.
+
+```
+builder.set_entry_point('some_package')
+```
+
+We set the entry point. This is equivalent to the -m some_package argument on the command line.
+
+```
+builder.set_shebang(sys.executable)
+```
+
+The Pex binary has a sophisticated argument to determine the right shebang line. This is sometimes specific to the expected deployment environment, so it is a good idea to put some thought into the right shebang line. One option is /usr/bin/env python, which will find what the current shell calls python. It is sometimes a good idea to specify a version here, such as /usr/local/bin/python3.6, for example.
+
+```
+subprocess.check_call([sys.executable, '-m', 'pip', 'wheel',
+                       '--wheel-dir', 'my-wheels',
+                       '--requirements', 'requirements.txt'])
+```
+
+Once again, we create wheels with pip. As tempting as it is, pip is not usable as a library, so shelling out is the only supported interface.
+
+```
+for dist in os.listdir('my-wheels'):
+    dist = os.path.join('my-wheels', dist)
+    builder.add_dist_location(dist)
+```
+
+We add all packages that pip built.
+
+```
+builder.build('my-file.pex')
+```
+
+Finally, we have the builder produce a Pex file.
+
+### 2.7.2 Shiv
+
+Shiv is a modern take on the same ideas behind Pex. However, since it uses pip directly, it needs to do a lot less itself.
+
+```
+$ shiv -o my-file.shiv -e some_package -r requirements.txt
+```
+
+Because shiv just offloads to pip actual dependency resolution, it is safe to call it directly. Shiv is a younger alternative to Pex. This means a lot of cruft has been removed, but it is still lacking somewhat in maturity.
+
+For example, the documentation for command-line arguments is a bit thin. There is also no way to currently use it as a library.
+2.8 XAR
+
+XAR (eXecutable ARchive) is a generic format for shipping self-contained executables. While not being Python specific, it is designed as Python first. It is natively installable via PyPI, for example.
+
+The downsides of XAR is that it assumes a certain level of system support for fuse (Filesystem in User SpacE) that is not universal yet. This is not a problem if all machines designed to run the XAR, Linux, or Mac OS X are under your control. The instructions for how to install proper FUSE support are not complex, but they do require administrative privileges. Note that XAR is also less mature than Pex.
+
+However, assuming proper SquashFS support, many other concerns vanish: including, most importantly, compared to pex or shiv, local Python versions. This makes XAR an interesting choice for either shipping developer tools or local system management scripts.
+
+In order to build a XAR, we can call setup.py with bdist_xar, if xar is installed.
+
+```
+python setup.py bdist_xar --console-scripts=my-script
+```
+
+In this example, my-script is the name of a console script entry point, specified in the setup.py with the following:
+
+```
+entry_points=dict(
+   console_scripts=["my-script = package.module:function"],
+)
+```
+In some cases, the --console-scripts argument is not necessary. If, as in the example above, there is only one console script entry point, then it is implied. Otherwise, if there is a console script with the same name as the package, then that one is used. This accounts for quite a few cases, which means this argument is often redundant.
