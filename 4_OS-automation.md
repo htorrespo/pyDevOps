@@ -53,8 +53,11 @@ A 0 byte finishes the “what is this file” metadata. This has various advanta
 ```
 >>> struct.unpack('>I', header[9+4+1:9+4+1+4])
 (1920,)
+```
 
 The next four bytes are the width, as a number in big-endian format. The struct module knows how to parse these. The > says it is big endian, and the I says it is an unsigned 4-byte integer.
+
+```
 >>> struct.unpack('>I', header[9+4+1+4:9+4+1+4+4])
 (1080,)
 ```
@@ -117,6 +120,7 @@ This combines powerfully with the path operations from os.path to allow safe cre
 def open_for_write(fname, mode=""):
     os.makedirs(os.path.dirname(fname), exists_ok=True)
     return open(fname, "w" + mode)
+    
 with open_for_write("some/deep/nested/name/of/file.txt") as fp:
     fp.write("hello world")
 ```
@@ -176,10 +180,13 @@ def add_to_docker(username):
     subprocess.check_call(["usermod", "-G", "docker", username])
 ```
 
-Note that this is safe to call even if the argument contains spaces, #, or other characters with special meanings.
+Note that this is safe to call even if the argument contains spaces, `#`, or other characters with special meanings.
 
 In order to tell which groups the current user is currently in, we can run groups.
+
+```
 groups = subprocess.check_output(["groups"]).split()
+```
 
 Again, this will automatically raise an exception if the command fails. If it succeeds, we get the output as a string: no need to manually read and determine end conditions.
 
@@ -217,6 +224,7 @@ with tempfile.TemporaryFile() as fp:
     fp.seek(0)
     proc = Popen(["sendmail"], stdin=fp)
     result = proc.poll()
+```
 
 In fact, in this case, we can even use the check_call function:
 
