@@ -170,3 +170,193 @@ It lets us test exactly what the contract of scale_one promises: in this case, t
 The emphasis on the importance of testing precise contracts is not accidental. This emphasis, which is a skill that is possible to learn and has principles that are possible to teach, makes unit tests into something that accelerate the process of writing code rather than make it slower.
 
 Much of the reason people have aversion to unit tests as “something that wastes time for DevOps engineers” and leads to a lot of poorly tested code that is foundational for business processes such as deployment of software is this misconception. Properly applying principles of high-quality unit testing leads to a more reliable foundation for operational code.
+
+## 5.2 Mocks, Stubs, and Fakes
+
+Typical DevOps code has outsized effects on the operating environment. Indeed, this is almost the definition of good DevOps code: it replaces a significant amount of manual work. This means that testing DevOps code needs to be done carefully: we cannot simply spin up a few hundred virtual machines for each test run.
+
+Automating operations means writing code that, run haphazardly, can have significant impact on production systems. When testing the code, it is worthwhile to have as few of these side effects as possible. Even if we have high-quality staging systems, sacrificing one every time there is a bug in operational code would lead to a lot of wasted time. It is important to remember that unit tests run on the worst code produced: the act of running them, and fixing bugs, means even code committed into feature branches is likelier to be in better condition.
+
+Because of that, we often try to run unit tests against a “fake” system. Classifying what we mean by “fake,” and how it impacts both unit tests and code design, is important: it is worthwhile thinking about how to test the code well before starting to write it.
+
+The neutral term for things that substitute for the systems not under test is “test doubles.” Fakes, mocks , and stubs usually have more precise meaning, though in casual conversation they will be used interchangeably.
+
+The most “authentic” test double is a “verified fake.” A verified fake fully implements the interface of the system not under test, though often simplified: perhaps less efficiently implemented, often without touching any external operating system. The “verified” refers to the fact that the fake has its own tests, verifying that it does indeed implement the interface.
+
+An example of a verified fake is using a memory-only SQLite database instead of a file-based one in tests. Since SQLite has its own tests, this is a verified fake: we can be confident it behaves like a real SQLite database.
+
+Below the verified fake is the fake. The fake implements an interface but often does it in such a rudimentary form that the implementation is simple, and not worth the effort to test.
+
+For example, it is possible to create an object with the same interface as subprocess.Popen but that never actually runs the process: instead, it simulates a process that consumes all standard input, and outputs some predetermined content into standard output and exits with a predetermined code.
+
+This object, if simple enough, might be a stub . A stub is a simple object that answers with predetermined data, always the same, holding almost no logic. This makes it easier to write, but it does make it constrained in what tests it can do.
+
+An inspector, or a spy, is an object that attaches to a test double and monitors the calls. Often, part of the contract of a function is that it will call some method with specific values. An inspector records the calls and can be used in assertions to make sure the right calls got the right arguments.
+
+If we combine an inspect or with a stub or a fake, we get a mock . Since this means that the stub/fake will have more functionality than the original (at least, whatever is needed to check the recording), this can lead to some side effects. However, the simplicity and immediacy of creating mocks often compensates by making testing code simpler.
+
+## 5.3 Testing Files
+
+The filesystem is, in many ways, the most important thing about a UNIX system. While the slogan “everything is a file” falls short of describing modern systems, the filesystem is still at the heart of most operations.
+
+The filesystem has several properties that are worthwhile to consider when thinking about testing file-manipulation code.
+
+First, filesystems tend to be robust. While bugs in filesystems are not unknown, they are rare, far between, and usually only triggered by extreme conditions or an unlikely combination of conditions.
+
+Next, filesystems tend to be fast. Consider the fact that unpacking a source tarball, a routine operation, will create many small files (on the order of several kilobytes) in quick succession. This is a combination of fast system-call mechanisms combined with sophisticated cache semantics when reading or writing files.
+
+Filesystems also have a curious fractal property: with the exception of some esoteric operations, a sub-sub-sub-directory supports the same semantics as the root directory.
+
+Finally, filesystems have a very thick interface. Some of it will be built into Python, even – consider that the module system reads files directly. There are also third-party C libraries that will use their own internal wrappers to access the filesystem as well as several ways to open files even in Python: the built-in file object as well as the os.open low-level operations.
+
+This combines to the following conclusion: for most file-manipulation code, faking out or mocking the filesystem is a low return on investment. The investment, in order to make sure we are only testing the contract of a function, is considerable; since the function could, conceivably, switch to low-level file-manipulation operations, we would need to reimplement a significant portion of Unix file semantics. The return is low; using the filesystem directly is fast, reliable, and, as long as the code merely allows us to pass an alternative “root path,” almost side-effect free.
+
+The best way to design file-manipulation code is to allow passing in such a “root path” argument, even if the default is /. Given such design, the best way to test is to create a temporary directory, populate it appropriately, call the code, and then garbage collect the directory.
+
+If we create the temporary directory using Python’s built-in tempfile module , then we can configure the Tox runner to put the temporary file inside of Tox’s built-in temporary directory, thus keeping the general file system clean and, usually, being compatible with whatever version control ignore file already ignores Tox artifacts.
+
+```python
+setenv =
+    TMPDIR = {envtmpdir}
+commands =
+    python -m 'import os;os.makedirs(sys.argv[1])' {envtmpdir}
+    # rest of test commands
+```
+
+Creating the temporary directory is important, since Python’s tempfile will only use the environment variable if pointing to a real directory.
+
+As an example, we will write tests for a function that looks for .js files and renames them to .py.
+
+```python
+def javascript_to_python_1(dirname):
+    for fname in os.listdir(dirname):
+        if fname.endswith('.js'):
+            os.rename(fname, fname[:3] + '.py')
+```
+
+This function uses the os.listdir call to find the file names and then renames them with os.rename.
+
+```python
+def javascript_to_python_2(dirname):
+    for fname in glob.glob(os.path.join(dirname, "∗.js")):
+        os.rename(fname, fname[:3] + '.py')
+```
+
+This function uses the glob.glob function to filter by wildcard all the files that match the `*.js` pattern.
+
+```python
+def javascript_to_python_3(dirname):
+    for path in pathlib.Path(dirname).iterdir():
+        if path.suffix == '.js':
+            path.rename(path.parent.joinpath(path.stem + '.py'))
+```
+
+The function uses the built-in module pathlib (new in Python 3) to iterate on the directory and find its children.
+
+The real function under test is not sure which implementation to use:
+
+```python
+def javascript_to_python(dirname):
+    return random.choice([javascript_to_python_1,
+                          javascript_to_python_2,
+                          javascript_to_python_3])(dirname)
+```
+
+Since we cannot be sure which implementation the function will use, we are left with only one choice: test the actual contract.
+
+In order to write a test, we will define some helper code. This code, in a real project, will live in a dedicated module, possibly named something like helpers_for_tests. This module would be tested, with its own unit tests.
+
+We first create a context manager for our temporary directory. This will ensure, as much as ensuring is possible, that the temporary directory will be cleaned up.
+
+```python
+@contextlib.contextmanager
+def get_temp_dir():
+    temp_dir = tempfile.mkdtemp()
+    try:
+        yield temp_dir
+    finally:
+        shutil.rmtree(temp_dir)
+```
+
+Since this test needs to create a lot of files, and we do not care about their contents too much, we define a helper method for that.
+
+```python
+def touch(fname, content=''):
+    with open(fname, 'a') as fpin:
+        fpin.write(content)
+```
+
+Now with the help of these functions, we can finally write a test:
+
+```python
+def test_javascript_to_python_simple():
+    with get_temp_dir() as temp_dir:
+        touch(os.path.join(temp_dir, 'foo.js'))
+        touch(os.path.join(temp_dir, 'bar.py'))
+        touch(os.path.join(temp_dir, 'baz.txt'))
+        javascript_to_python(temp_dir)
+        assert_that(set(os.listdir(temp_dir)),
+                    is_({'foo.py', 'bar.py', 'baz.txt'}))
+```
+
+For a real project, we would write more tests, many of them possibly using our get_temp_dir and touch helpers above.
+
+If we have a function that is supposed to check a specific path, we can have it take an argument to “relativize” its paths.
+
+For example, let us say we want a function to analyze our Debian installation paths and give us a list of all domains that we download packages from.
+
+```python
+def _analyze_debian_paths_from_file(fpin):
+    for line in fpin:
+        line = line.strip()
+        if not line:
+            continue
+        line = line.split('#', 1)[0]
+        parts = line.split()
+        if parts[0] != 'deb':
+            continue
+        if parts[1][0] == '[':
+            del parts[1]
+        parsed = hyperlink.URL.from_text(parts[1].decode('ascii'))
+        yield parsed.host
+```
+
+A naive approach would be to test _analyze_debian_paths_from_file. However, it is an internal function and has no contract. The implementation can change, perhaps reading the files and then scanning all strings, or possibly breaking up this function and letting the top-level handle the line loop.
+
+Instead, we want to test the public API:
+
+```python
+def analyze_debian_paths():
+    for fname in os.listdir('/etc/apt/sources.list.d'):
+        with open(os.path.join('/etc/apt/sources.list.d', fname)) as fpin:
+            yield from _analyze_debian_paths_from_file(fpin)
+```
+
+However, we cannot control the directory /etc/apt/sources.list.d without root privileges, and even with root privileges, this would be a risk: letting each test run control such a sensitive directory. Additionally, many Continuous Integration systems are not designed for running tests with root privileges, for good reasons, making this a problematic approach.
+
+Instead, we can generalize the function a little bit. This means intentionally expanding the official, public API of the function to allow testing. This is definitely a trade-off.
+
+However, the expansion is minimal: all we need is an explicit directory in which to work. In return, we get to simplify our testing requirements while avoiding any kind of “patching,” which inevitably starts poking at private implementation details.
+
+```python
+def analyze_debian_paths(relative_to='/'):
+    sources_dir = os.path.join(relative_to, 'etc/apt/sources.list.d')
+    for fname in os.listdir(sources_dir):
+        with open(os.path.join(sources_dir, fname)) as fpin:
+            yield from _analyze_debian_paths_from_file(fpin)
+```
+
+Now, using the same helpers as before, we can write a simple test for this:
+
+```python
+def test_analyze_debian_paths():
+    with get_temp_dir() as root:
+        touch(os.path.join(root, 'foo.list'),
+              content='deb http://foo.example.com\n')
+        ret = list(analyze_debian_paths(relative_to=root))
+        assert(ret, equals_to(['foo.example.com']))
+```
+
+Again, in a real project, we would write more than one test and try to make sure many more cases are covered. Those could be built using the same techniques.
+
+It is a good habit to add a relative_to parameter to any function that accesses specific paths.
