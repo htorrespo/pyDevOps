@@ -361,4 +361,302 @@ Again, in a real project, we would write more than one test and try to make sure
 
 It is a good habit to add a relative_to parameter to any function that accesses specific paths.
 
-## 
+## 5.4 Testing Processes
+
+Testing process-manipulation code is often a subtle endeavor, full of trade-offs. In theory, process running code has a thick interface with the operating system; we covered the subprocess module, but it is possible to use the os.spawn* functions directly, or even use code os.fork and os.exec* functions. Likewise, the standard output/input communication mechanism can be implemented in many ways, including using the Popen abstraction or directly manipulating file descriptors with os.pipe and os.dup.
+
+Process-manipulation code can also be some of the most fragile. Running external commands depends on the behavior of those commands, as a starting point. The inter-process communication means that the flow is inherently concurrent. It is too easy to make the mistake of making the tests rely on ordering assumptions that are not always true. Those mistakes can lead to “flaky” tests: ones that pass most of the time, but fail under seemingly random circumstances.
+
+Those ordering assumptions can sometimes be true more often on development machines, or unloaded machines, which means bugs will only be exposed in production, or possibly in production only in extreme circumstances.
+
+This is one of the reasons the chapter about using processes concentrated on ways to reduce concurrency and have things more sequential. For this reason, too, it is worthwhile, carefully designing process code to be reliably testable. That design, in itself, will often cause pressure on the code to be simple and reliable.
+
+If the code just uses subprocess.check_call and subprocess.check_output, without taking advantage of exotic parameters, we can often use a simplified form of a pattern called “dependency injection” to make it testable. In this case, “dependency injection” is just a fancy way of saying “passing parameters to a function.”
+
+Consider the following function:
+
+```python
+def error_lines(container_name):
+    logs = subprocess.check_output(["docker", "logs", container_name])
+    for line in logs:
+        if 'error' in line:
+            return line
+```
+This function is unpleasant to test. We can use advanced patching to replace subprocess.check_output, but this would be error prone and rely on implementation details. Instead, we can explicitly elevate that implementation detail into being a part of the contract:
+
+```python
+def error_lines(container_name, runner=subprocess.check_output):
+    logs = runner(["docker", "logs", container_name])
+    
+    for line in logs:
+        if 'error' in line:
+            yield line.strip()
+```
+Now that runner is part of the official interface, testing becomes much easier. This might seem a trivial change, but it is deeper than it looks; in some sense, error_lines has now voluntarily constrained its interface to process running.
+
+We might want to test it with something like the following:
+
+```python
+def test_error_lines():
+    
+    container_name = 'foo'
+    
+    def runner(args):
+        
+        if args[0] != 'docker':
+            raise ValueError("Can only run docker", args)
+        
+        if args[1] != 'logs':
+            raise ValueError("Can only run docker logs", args)
+        
+        if args[2] != container_name:
+            raise ValueError("No such container", args[2])
+        
+        return iter(["hello\n", "error: 5 is not 6\n", "goodbye\n"])
+    
+    ret = error_lines(container_name, runner=runner)
+    assert_that(list(ret), is_(["error: 5 is not 6"))
+```
+
+Note that, in this case, we did not restrict ourselves to only checking the contract: error_lines could have run, for example, docker logs -- <container_name>. However, one advantage of our method is that we can slowly improve our fidelity and only improve the test.
+
+For example, we can add to runner:
+
+```python
+def runner(args):
+    
+    if args[0] != 'docker':
+        raise ValueError("Can only run docker", args)
+    
+    if args[1] != 'logs':
+        raise ValueError("Can only run docker logs", args)
+    
+    if args[2] == '--':
+        arg_container_name = args[3]
+    
+    else:
+        arg_container_name = args[2]
+    
+    if args_container_name != container_name:
+        raise ValueError("No such container", args[2])
+    
+    return iter(["hello\n", "error: 5 is not 6\n", "goodbye\n"])
+```
+
+This will still work with the old version of the code and will also work with post-modification code. Fully emulating the docker is not realistic or worthwhile. However, this approach would slowly improve the accuracy of the test, with no downsides.
+
+If a significant amount of our code interfaces, for example, with docker, we can eventually factor out a mini-docker-emulator like that into its own test helper library.
+
+Using higher-level abstractions for process running helps with this sort of approach. The seashore library, for example, separates the part that calculates the commands from the low-level runner, which allows substituting only the low-level one.
+
+```python
+def error_lines(container_name, executor):
+    logs, _ignored = executor.docker.logs(container_name).batch()
+    
+    for line in logs.splitlines():
+        if 'error' in line:
+            yield line.strip()
+```
+When run in production, somewhere at the top, an executor object will be created with code that looks like this:
+executor = seashore.Executor(seashore.Shell())
+
+That object will be passed down to whatever is calling error_lines and used there. In general, when using seashore , we leave the creation of the executor to the top-level functionality.
+
+In the test, we create our own shell:
+
+```python
+@attr.s
+class DummyShell:
+    
+    _container_name = attr.ib()
+    
+    def batch(self, ∗args, ∗∗kwargs):
+        if (args == ['docker', 'logs', self._container_name] and
+            kwargs == {}):
+            return "hello\nerror: 5 is not 6\ngoodbye\n", ""
+        raise ValueError("unknown command", self, args, kwargs)
+
+def test_error_lines():
+    container_name = 'foo'
+    executor = seashore.Executor(DummyShell(container_name))
+    ret = error_lines(container_name, executor)
+    assert_that(list(ret), is_(["error: 5 is not 6"]))
+```
+
+Using the attrs library, especially when writing various fakes, is often a good idea. Fakes tend to be, intentionally, simple objects. Since they will be involved in assertions and exceptions, it is useful to have high-quality representations of them. This is exactly the kind of boilerplate that attrs helps reduce.
+
+Again, we might need to slowly upgrade our fidelity.
+
+Because processes are so hard to test, it is good to use process running only when necessary. Especially when porting over shell scripts to Python – often a good idea when they grow in complexity – it is good to substitute long pipelines with in-memory data processing.
+
+Especially if we factor the code the right way, with the data processing as a simple pure function that takes an argument and returns a value, the bulk of the code becomes a pleasure to test.
+
+Imagine, for example, the pipeline,
+
+```terminal
+ps aux | grep conky | grep -v grep | awk '{print $2}' | xargs kill
+```
+This will kill all processes that have conky in their names.
+
+Here is a way to refactor the code to make it easier to test:
+
+```python
+def get_pids(lines):
+    for line in lines:
+        if 'conky' not in line:
+            continue
+        parts = line.split()
+        pid_part = parts[1]
+        pid = int(pid_part)
+        yield pid
+
+def ps_aux(runner=subprocess.check_output):
+    return runner(["ps", "aux"])
+
+def kill(pids, killer=os.kill):
+    for pid in pids:
+        killer(pid, signal.SIGTERM)
+
+def main():
+    kill(get_pid(ps_aux()))
+```
+
+Note how the most complicated code is now in a pure function: get_pids . Hopefully, this means most bugs will be there, and we can unit test against them.
+
+The code that is harder to unit test, get_pids, where we have to do ad hoc dependency injection, is now in simple functions that have fewer failure modes.
+
+The main logic is in functions that do data processing. Testing those just requires supplying simple data structure and observing the return value. Moving potential bugs from the system-related code, which requires more effort to unit test, to the pure logic, which is easier to unit test, means reducing the bugs; more bugs will be caught with unit tests.
+
+## 5.5 Testing Networking
+
+In the requests library documentation, using the Session object falls under the “advanced” section. This is unfortunate. For anything other than throwaway scripts, or interactive REPL usage, using the Session object is the best option. Testing is by far the least of the reasons – but once Session is used, testing becomes a lot easier.
+
+Simple example code using requests might look like this:
+
+```python
+def get_files(gist_id):
+    gist = requests.get(f"https://api.github.com/gists/{gist_id}").json()
+    result = {}
+    for name, details in gist["files"].items():
+        result[name] = requests.get(details["raw_url"]).content
+    return result
+```
+
+This would be hard to test in isolation. Instead, we rewrite it to take an explicit session object:
+
+```python
+def get_files(gist_id, session=None):
+    if session is None:
+        session = requests.Session()
+    gist = session.get(f"https://api.github.com/gists/{gist_id}").json()
+    result = {}
+    for name, details in gist["files"].items():
+        result[name] = session.get(details["raw_url"]).content
+    return result
+```
+
+The code is almost identical. However, now testing becomes a simple matter of writing an object with a get method .
+
+```python
+@attr.s(frozen=True)
+class Gist:
+    files = attr.ib()
+
+@attr.s(frozen=True):
+class Response:
+    
+    content = attr.ib()
+    
+    def json(self):
+        return json.loads(content)
+
+@attr.s(frozen=True)
+class FakeSession:
+    
+    _gists = attr.ib()
+    
+    def get(self, url):
+        parsed = hyperlink.URL.from_text(url)
+        if parsed.host == 'api.github.com':
+            tail = path.rsplit('/', 1)[-1]
+            gist = self._gists[tail]
+            res = dict(files={name: f'http://example.com/{tail}/{name}'
+                              for name in gist.files})
+            return Repsonse(json.dumps(res))
+        if parsed.host == 'example.com':
+            _ignored, gist, name = path.split('/')
+            return Response(self.gists[gist][name])
+```
+
+This is a bit long-winded. We can sometimes, if this functionality is localized and writing a whole helper library is not worth it, use the unittest.mock library .
+
+```python
+def make_mock():
+    gist_name = 'some_name'
+    files = {'some_file': 'some_content'}
+    session = mock.Mock()
+    session.get.content.return_value = 'some_content'
+    session.get.json.return_value = json.dumps({'files': 'some_file'})
+    return session
+```
+
+This is a “quick and dirty” hack, counting on the fact (that is not in the contract) that the file content is retrieved using content, and the gist’s logical structure is retrieved using json. However, it is often better to write a quick test using mocks that depend a little on the implementation details rather than not writing a test at all.
+
+It is important to think of tests like this as “technical debt” and improve them at some point to depend more on the contract and less on the implementation details. A good way to do it is to put a comment in the code, and link it to an issue tracker. This also makes it obvious to test code readers that this is still a work in progress.
+
+The other important thing is that, if a new implementation breaks the test, the right way to fix it is, in general, not to write another test against the new implementation. The right way to fix it is to move more of the test to contract-based testing. This can be done by first improving the test, but making sure it runs against the old code. Then comes refactoring the code and seeing the test still passing.
+
+When writing network code that deals with lower-level concepts, such as sockets, similar ideas still apply. Since the creation of the socket object is separate from any usage of it, a lot of mileage can be gotten out of writing functions that accept socket objects, and creating them outside.
+
+In order to simulate extreme conditions and see if our code can work in spite of them, we might want to use something like the following as a socket fake:
+
+```python
+@attr.s
+class FakeSimpleSocket:
+    
+    _chunk_size = attr.ib()
+    _received = attr.ib(init=False, factory=list)
+    _to_send = attr.ib()
+    
+    def connect(self, addr):
+        pass
+    
+    def send(self, blob):
+        actually_sent = blob[:chunk_size]
+        self._received.append(actually_sent)
+        return len(actually_sent)
+    
+    def recv(self, max_size):
+        chunk_size = min(max_size, self._chunk_size)
+        received, self._to_send = (self._to_send[:chunk_size],
+                                   self._to_send[chunk_size:])
+        return received
+```
+
+This allows us to control the size of “chunks.” An extreme test would be to use a chunk_size of 1. This means bytes would go out one at a time, and they would be received one at a time. No real network would be this bad, but a unit test allows us to simulate more extreme conditions than any reasonable network.
+
+This fake is useful to test networking code. For example, this code does some ad hoc HTTP to get a result:
+
+```python
+def get_get(sock):
+    sock.connect(('httpbin.org', 80))
+    sock.send(b'GET /get HTTP/1.0\r\nHost: httpbin.org\r\n\r\n')
+    res = sock.recv(1024)
+    return json.loads(res.decode('ascii').split('\r\n\r\n', 1)[1]))
+```
+
+It has a subtle bug in it. We can uncover the bug with a simple unit test, using the socket fake.
+
+```python
+def test_get_get():
+    result = dict(url='http://httpbin.org/get')
+    headers = 'HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n'
+    output = headers + json.dumps(result)
+    fake_sock = FakeSimpleSocket(to_send=output, chunk_size=1)
+    value = get_get(fake_sock)
+    assert_that(value, is_(result))
+```
+
+This test would fail: our get_get assumes a good quality network connection, and this simulates a bad one. It would succeed if we changed chunk_size to 1024.
+
+We could run the test in a loop, testing chunk sizes from 1 to 1024. In a real test we would also check the sent data, and possibly also send invalid results to see the response. The important thing, however, is that none of those things need setting up clients or servers, or trying to realistically simulate bad networks.
