@@ -22,3 +22,10 @@ Properly speaking, only Unicode is “text.” This is what Python strings repre
 Remembering the difference between encoding and decoding is crucial in order to manipulate textual data. A way to remember it is that since UTF-8 is an encoding, moving from strings to UTF-8 encoded data is “encoding,” while moving from UTF-8 encoded data to strings is “decoding.”
 
 UTF-8 has an interesting property: when given a Unicode string that happens to be ASCII, it will produce bytes with the values of the code points. This means that “visually,” the encoded and decoded form will look the same.
+
+```python
+>>> "hello".encode("utf-8")
+b'hello'
+>>> "hello".encode("utf-16")
+b'\xff\xfeh\x00e\x00l\x00l\x00o\x00'
+```
